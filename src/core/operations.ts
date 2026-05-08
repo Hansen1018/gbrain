@@ -270,9 +270,14 @@ export interface OperationContext {
    * by the MCP HTTP/stdio dispatch layer from `access_tokens.permissions.takes_holders`.
    *
    * When set (i.e., this OperationContext came from an MCP-bound token),
-   * `takes_list`, `takes_search`, and `query` (when it returns takes) MUST
-   * apply `WHERE holder = ANY($takesHoldersAllowList)`. This is the
-   * server-side filter that backs the v0.28 visibility model.
+   * `takes_list`, `takes_search`, `takes_scorecard`, `takes_calibration`,
+   * and `query` (when it returns takes) MUST apply `WHERE holder = ANY($takesHoldersAllowList)`.
+   * This is the server-side filter that backs the v0.28+ visibility model.
+   *
+   * v0.30.0: aggregate ops (`takes_scorecard`, `takes_calibration`) require
+   * the allow-list as a TS-required engine method param (fail-closed by
+   * compiler). Hidden-holder rows contribute zero to aggregates. The CLI
+   * callers (local + trusted) leave it undefined.
    *
    * Default behavior when unset: local CLI callers see all holders. v0.28
    * MCP dispatch sets it to `['world']` for tokens with no permissions row
@@ -1023,6 +1028,62 @@ const takes_search: Operation = {
   cliHints: { name: 'takes-search', positional: ['query'] },
 };
 
+/**
+ * v0.30.0 (Slice A1): aggregate calibration scorecard. Pure SQL aggregation.
+ *
+ * Privacy (D4 fail-closed): the engine method REQUIRES the takesHoldersAllowList
+ * param. The handler threads it from the OperationContext so MCP-bound callers
+ * see only their permitted holders' aggregate counts. Local CLI callers
+ * (ctx.takesHoldersAllowList=undefined) get the full scorecard.
+ */
+const takes_scorecard: Operation = {
+  name: 'takes_scorecard',
+  description: 'Calibration scorecard for resolved bets: counts, accuracy, Brier (correct ∨ incorrect only), partial_rate.',
+  scope: 'read',
+  params: {
+    holder: { type: 'string', description: 'Filter to this holder (world|garry|brain|<slug>)' },
+    domain_prefix: { type: 'string', description: 'Slug prefix (e.g. companies/) to scope the scorecard' },
+    since: { type: 'string', description: 'Window start (YYYY-MM-DD)' },
+    until: { type: 'string', description: 'Window end (YYYY-MM-DD)' },
+  },
+  handler: async (ctx, p) => {
+    return ctx.engine.getScorecard(
+      {
+        holder: p.holder as string | undefined,
+        domainPrefix: p.domain_prefix as string | undefined,
+        since: p.since as string | undefined,
+        until: p.until as string | undefined,
+      },
+      ctx.takesHoldersAllowList,
+    );
+  },
+  cliHints: { name: 'takes-scorecard' },
+};
+
+/**
+ * v0.30.0 (Slice A1): calibration curve binned by stated weight. Pure SQL.
+ * Same allow-list contract as takes_scorecard.
+ */
+const takes_calibration: Operation = {
+  name: 'takes_calibration',
+  description: 'Calibration curve: resolved correct/incorrect bets binned by stated weight; observed vs predicted per bucket.',
+  scope: 'read',
+  params: {
+    holder: { type: 'string', description: 'Filter to this holder' },
+    bucket_size: { type: 'number', description: 'Bucket width in (0,1]; default 0.1' },
+  },
+  handler: async (ctx, p) => {
+    return ctx.engine.getCalibrationCurve(
+      {
+        holder: p.holder as string | undefined,
+        bucketSize: p.bucket_size as number | undefined,
+      },
+      ctx.takesHoldersAllowList,
+    );
+  },
+  cliHints: { name: 'takes-calibration' },
+};
+
 const think: Operation = {
   name: 'think',
   description: 'Multi-hop synthesis across pages + takes + graph. Pulls relevant evidence and produces a cited answer with conflict + gap analysis.',
@@ -1308,6 +1369,35 @@ const get_health: Operation = {
   },
   scope: 'admin',
   cliHints: { name: 'health' },
+};
+
+/**
+ * Multi-topology v1 (Tier B): structured doctor report for remote callers.
+ *
+ * First read-only diagnostic op exposed over HTTP MCP. Wraps the focused
+ * thin-client check set in `src/commands/doctor.ts:doctorReportRemote()` and
+ * returns the structured `DoctorReport` JSON verbatim. The matching client-
+ * side renderer lives in `src/commands/remote.ts` (used by `gbrain remote
+ * doctor`). Local doctor is unchanged — operators on the host still get the
+ * full check set.
+ *
+ * scope=admin because some checks expose system-state (queue depth, schema
+ * version) that read-only consumers don't need. localOnly=false so HTTP
+ * callers can invoke it. No mutation; safe to call repeatedly.
+ *
+ * Precedent: doctor only. Generalizing to lint/integrity/orphans is filed as
+ * follow-up work pending demand.
+ */
+const run_doctor: Operation = {
+  name: 'run_doctor',
+  description: 'Run brain health checks and return a structured DoctorReport (thin-client doctor surface).',
+  params: {},
+  handler: async (ctx) => {
+    const { doctorReportRemote } = await import('../commands/doctor.ts');
+    return doctorReportRemote(ctx.engine);
+  },
+  scope: 'admin',
+  localOnly: false,
 };
 
 const get_versions: Operation = {
@@ -2144,7 +2234,7 @@ export const operations: Operation[] = [
   // Timeline
   add_timeline_entry, get_timeline,
   // Admin
-  get_stats, get_health, get_versions, revert_version,
+  get_stats, get_health, run_doctor, get_versions, revert_version,
   // Sync
   sync_brain,
   // Raw data
@@ -2162,6 +2252,8 @@ export const operations: Operation[] = [
   find_orphans,
   // v0.28: Takes + think
   takes_list, takes_search, think,
+  // v0.30: calibration aggregates over takes
+  takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
   whoami, sources_add, sources_list, sources_remove, sources_status,
   // v0.29: Salience + anomalies + recent transcripts

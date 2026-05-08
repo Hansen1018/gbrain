@@ -2,6 +2,233 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.30.0] - 2026-05-07
+
+**Calibration scorecards land. Find out if your bets are actually as good as you think.**
+**Brier scores, prediction accuracy, calibration curves — for every bet you ever wrote down.**
+
+This is the v0.30 wave's first ship: the calibration core. Resolve your bets with three
+states (correct, incorrect, partial) instead of just true/false. Run a scorecard against
+any holder, any domain prefix, any date window, and see your accuracy + Brier score in
+seconds. The calibration curve shows whether your "I'm 80% confident" bets actually come
+in at 80% — the thing Daniel Kahneman spent a career studying, now a query.
+
+```bash
+gbrain takes resolve companies/some-yc-co --row 3 --quality correct --evidence "Series A closed at $50M"
+gbrain takes scorecard garry
+gbrain takes calibration garry --bucket-size 0.1
+```
+
+The scorecard prints `correct/incorrect/partial`, accuracy, Brier (lower is better; 0.25
+is the always-50% baseline), and a `partial_rate` line. When more than 20% of resolved
+bets are "partial," the scorecard prints `[!] partial_rate is high — calibration may be
+optimistic`. Hedged bets escape the Brier denominator, so the warning surfaces hedging
+behavior as its own signal even though it doesn't enter the math.
+
+### The math that matters
+
+| Field | Meaning | Math |
+|-------|---------|------|
+| `accuracy` | correct / (correct + incorrect) | partial excluded |
+| `brier` | mean((weight − outcome)²) over correct ∨ incorrect | lower is better; 0 = perfect; 0.25 = always-50% baseline |
+| `partial_rate` | partial / resolved | hedging signal; warns at >20% |
+
+Brier excludes partial deliberately. Codex pointed out that counting partial as 0.5 in
+the math would reward hedging into ambiguity; instead, partial bets leave the calibration
+denominator entirely AND surface as a separate counter. You can see whether you're
+miscalibrated AND whether you're hedging, side by side.
+
+### Privacy: aggregate queries fail-closed
+
+Scorecard and calibration are MCP-callable read ops (`takes_scorecard`,
+`takes_calibration`). Both engine methods take `takesHoldersAllowList` as a REQUIRED
+TypeScript parameter — the compiler is the first line of defense against accidentally
+exposing therapy-page takes to an MCP-bound agent via aggregate counts. Hidden-holder
+rows contribute zero to the math. Local CLI callers see all holders.
+
+### Markdown stays canonical (and the silent-data-loss bug is dead)
+
+Resolution metadata renders into the takes-fence on disk: `resolved | quality |
+evidence | value | unit | by` columns appear ONLY when at least one row on the page is
+resolved. Pages with no resolved rows keep the narrow 7-column shape exactly as before.
+
+A codex consult on the v0.30 plan caught a real bug in the original draft: the v0.28
+parser/renderer had no concept of resolution columns. Without an explicit fix, every
+`gbrain takes update` after a `takes resolve` would silently delete the resolution
+data on the next disk write. The new round-trip preservation tests
+(`test/takes-fence.test.ts` v0.30 section) are the regression gate; they fail loudly
+if the data-loss bug returns.
+
+### To take advantage of v0.30.0
+
+`gbrain upgrade` runs the schema migration automatically. If `gbrain doctor` warns
+about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Resolve a bet you already have:**
+   ```bash
+   gbrain takes resolve <slug> --row N --quality correct|incorrect|partial --evidence "..."
+   ```
+3. **Run your first scorecard:**
+   ```bash
+   gbrain takes scorecard garry
+   ```
+4. **Existing v0.28-resolved bets are auto-backfilled.** The migration maps legacy
+   `resolved_outcome=true` → `resolved_quality='correct'`, `false` → `'incorrect'`.
+   No manual reclassification needed.
+5. **The `--outcome true|false` flag still works** as a back-compat alias on `takes
+   resolve`, with a stderr deprecation warning. Cannot express partial; mutually
+   exclusive with `--quality`.
+
+If any step fails or the numbers look wrong, file an issue:
+https://github.com/garrytan/gbrain/issues with output of `gbrain doctor` and
+`~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+#### Added
+- New CLI: `gbrain takes scorecard [<holder>] [--domain <prefix>] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]` — calibration scorecard.
+- New CLI: `gbrain takes calibration [<holder>] [--bucket-size 0.1] [--json]` — calibration curve binned by stated weight.
+- New flag: `--quality correct|incorrect|partial` on `gbrain takes resolve`. Primary input.
+- New flag: `--evidence "..."` on `gbrain takes resolve` — semantic alias for `--source`.
+- New MCP ops: `takes_scorecard` (read scope) + `takes_calibration` (read scope), both honoring per-token allow-list.
+- Schema migration v43 (`takes_resolved_quality_and_drift_decisions`):
+  - `takes.resolved_quality TEXT` with CHECK `(IN ('correct','incorrect','partial'))`.
+  - `takes_resolution_consistency` CHECK constraint enforces (quality, outcome) tuple consistency at the DB layer.
+  - Backfill: legacy `resolved_outcome=true` → `resolved_quality='correct'`; `false` → `'incorrect'`.
+  - Partial index `idx_takes_scorecard ON takes (holder, kind, resolved_quality) WHERE resolved_quality IS NOT NULL` — scorecard hot path.
+  - New table `drift_decisions` (audit log for the upcoming v0.30.3 drift LLM judge; defined now so C1 carries no migration).
+- New module `src/core/takes-resolution.ts` — pure helpers (`deriveResolutionTuple`, `finalizeScorecard`, `PARTIAL_RATE_WARNING_THRESHOLD`) shared between Postgres + PGLite engines.
+
+#### Changed
+- `gbrain takes resolve` now writes both `resolved_outcome` (boolean) and `resolved_quality` (text) on every resolution. Schema CHECK is the defense-in-depth backstop.
+- `--outcome true|false` becomes a back-compat alias with a stderr deprecation warning. Mutually exclusive with `--quality`. Cannot express partial.
+- `Take` interface (`src/core/engine.ts`) adds `resolved_quality: 'correct' | 'incorrect' | 'partial' | null`.
+- `TakeResolution` adds optional `quality` field. `outcome` stays as the back-compat input. When both set and inconsistent, throws `TAKE_RESOLUTION_INVALID` instead of silently overwriting.
+- `BrainEngine` interface gains `getScorecard(opts, allowList)` and `getCalibrationCurve(opts, allowList)`. Both implemented in `postgres-engine.ts` + `pglite-engine.ts` with SQL-level `WHERE holder = ANY($allowList)` filtering inside the GROUP BY.
+- `ParsedTake` (`src/core/takes-fence.ts`) extended with optional `resolvedAt`, `resolvedQuality`, `resolvedOutcome`, `resolvedEvidence`, `resolvedValue`, `resolvedUnit`, `resolvedBy`. Parser detects v0.30-shape headers; renderer emits resolution columns only when at least one row has `resolvedQuality !== undefined`.
+- `cmdResolve` mirrors resolution metadata into the takes-fence on disk via the page-lock-aware path. Round-trip preservation keeps resolution data intact across unrelated edits.
+
+#### Tests
+53 new cases (34 unit + 19 E2E):
+- 11 cases in `test/takes-fence.test.ts` for v0.30 resolution columns, round-trip preservation (the codex F3 regression gate), narrow-shape preservation, partial rendering, `upsertTakeRow` and `supersedeRow` resolution preservation.
+- 16 cases in `test/takes-resolution.test.ts` for `deriveResolutionTuple` and `finalizeScorecard` Brier math (n=0, hand-calculated 4-bet reference at Brier=0.205, partial-exclusion contract, partial_rate threshold).
+- 7 cases in `test/takes-engine.test.ts` for v0.30 quality semantics on PGLite, contradictory-input rejection, scorecard hand-calc against the same 4-bet fixture, n=0 handling, SQL-level allow-list privacy filter.
+- 11 cases in `test/e2e/takes-scorecard-parity.test.ts` (NEW) — same fixture into Postgres + PGLite, asserts `getScorecard` and `getCalibrationCurve` return byte-identical results across engines, and that the SQL-level allow-list filter strictly subtracts hidden-holder rows on both engines.
+- 8 cases extended in `test/e2e/takes-postgres.test.ts` — `--quality correct/partial/back-compat` writes the expected (quality, outcome) tuple on real PG; the `takes_resolution_consistency` CHECK constraint actively rejects contradictory raw `UPDATE`s; scorecard + calibration coherent shape; PRIVACY allow-list filter on real PG; MCP dispatch path for `takes_scorecard` + `takes_calibration`.
+
+The E2E parity test caught two real bugs PGLite tolerated: postgres.js was sending `${bucketSize}` as a string and `FLOOR(weight / '0.1')` was throwing `invalid input syntax for type integer`; even after the type cast, IEEE 754 made `FLOOR(0.7 / 0.1)` return 6 on real PG and 7 on PGLite, so calibration buckets diverged at boundaries. Both fixed with `weight::numeric / $N::numeric` (exact decimal arithmetic, engine-agnostic).
+
+#### Migration ordering
+- All wave schema (resolved_quality, CHECK, partial index, drift_decisions table) bundled into migration v43 in v0.30.0 (renumbered from v40 on master merge — master claimed v40-v42 with the v0.29 + v0.29.1 salience-and-recency wave). Migration runner sorts by version number, so the rename is mechanical — no semantic change. Slices A2/B1/C1 (trajectory + annual-review, meeting extraction CLI, drift judge) add no migrations of their own.
+
+## [0.29.2] - 2026-05-07
+
+**Thin-client mode: install gbrain on a laptop without a local DB and have it consume a remote brain over MCP.**
+**`gbrain init --mcp-only` + `gbrain remote ping` + `gbrain remote doctor` + run_doctor MCP op.**
+
+You can now run `gbrain init --mcp-only --issuer-url <url> --mcp-url <url>/mcp --oauth-client-id <id> --oauth-client-secret <secret>` on a machine that should NOT have its own brain. No PGLite file gets created. No Postgres connection. Three pre-flight smoke probes run before the config lands so a typo in the URL or a bad credential surfaces up front, not later. The CLI's dispatch guard refuses every DB-bound subcommand (`sync`, `embed`, `extract`, `migrate`, `apply-migrations`, `repair-jsonb`, `orphans`, `integrity`, `serve`) with a single canonical error pointing at the remote host. `gbrain doctor` runs a thin-client check set instead: OAuth discovery, token round-trip, MCP initialize.
+
+Once configured, `gbrain remote ping` triggers an autopilot cycle on the remote host and polls until terminal so you don't have to wait for the autopilot cron after writing markdown. `gbrain remote doctor` calls a new `run_doctor` MCP op (admin scope, HTTP-reachable) that returns a structured DoctorReport from the remote host's brain. Fast feedback when something's off.
+
+The new `docs/architecture/topologies.md` documents three deployment shapes (single brain, cross-machine thin client, per-worktree code engines + shared remote artifacts) so users and gstack can compose them deliberately. Topology 3 (per-worktree split-engine for Conductor users) needs zero gbrain code changes — `GBRAIN_HOME` already overrides `~/.gbrain` and `gbrain serve --http --port N` already runs on any port. The new doc spells out the alias-routing footgun (wrong alias = silent wrong-brain writes) explicitly.
+
+### What this means for you
+
+A v0.29.1 caller upgrading to v0.29.2 with no setup change gets identical local-only behavior. The thin-client surface is pure opt-in: only fires when `~/.gbrain/config.json` carries a `remote_mcp` block. Existing local-engine installs are unchanged.
+
+If you want to actually use thin-client mode:
+
+1. On the host running `gbrain serve --http`: `gbrain auth register-client <name> --grant-types client_credentials --scopes "read write admin"` (admin needed for ping + doctor).
+2. On the consuming machine: `gbrain init --mcp-only --issuer-url <issuer> --mcp-url <issuer>/mcp --oauth-client-id <id> --oauth-client-secret <secret>`.
+3. Configure your agent's MCP client to point at the host's `mcp_url` with the bearer token. Per-client snippets in `docs/mcp/`.
+4. `gbrain doctor` to verify connectivity, `gbrain remote ping` after writes, `gbrain remote doctor` for remote-side health.
+
+The full setup recipe and three topology diagrams live in `docs/architecture/topologies.md`.
+
+## To take advantage of v0.29.2
+
+`gbrain upgrade` does this automatically — no schema migration, no data backfill. The thin-client surface is opt-in via the `--mcp-only` flag.
+
+If you're setting up a new thin-client install:
+
+```bash
+# On the host
+gbrain serve --http --port 3001
+gbrain auth register-client neuromancer --grant-types client_credentials --scopes "read write admin"
+
+# On the thin client
+gbrain init --mcp-only \
+  --issuer-url https://brain-host:3001 \
+  --mcp-url https://brain-host:3001/mcp \
+  --oauth-client-id <id> --oauth-client-secret <secret>
+
+# Verify
+gbrain doctor          # thin-client check set: discovery, token, MCP smoke
+gbrain remote doctor   # ask the host to run its own doctor
+gbrain remote ping     # trigger an autopilot cycle on the host
+```
+
+If anything fails, please file an issue: https://github.com/garrytan/gbrain/issues with:
+- output of `gbrain doctor --json` from the thin client
+- a redacted copy of `~/.gbrain/config.json`
+- which step failed
+
+### Itemized changes
+
+**New CLI surfaces**:
+
+- `gbrain init --mcp-only` (`src/commands/init.ts`) — thin-client setup. Pre-flight runs OAuth discovery, `/token` round-trip, and MCP initialize against the remote before writing config. Re-run guard refuses without `--force` when `~/.gbrain/config.json` already has `remote_mcp` set, so scripted setup-loops can't silently re-create a local DB on a thin-client machine.
+- `gbrain remote ping` (`src/commands/remote.ts`) — submits an `autopilot-cycle` job on the remote via `submit_job` MCP op, polls `get_job` with backoff (1s × 30s, then 5s × 5min, then 10s), exits when terminal. Default cap 15min, override with `--timeout 5m` or `--timeout 30m`. NO `repo` arg passed — autopilot uses the host's configured brain repo, no caller-controlled paths.
+- `gbrain remote doctor` (`src/commands/remote.ts`) — calls the new `run_doctor` MCP op, renders the DoctorReport. Exit 0/1 based on status.
+
+**New config field**:
+
+- `remote_mcp: {issuer_url, mcp_url, oauth_client_id, oauth_client_secret}` on `GBrainConfig`. Two URLs because OAuth discovery + `/token` live at the issuer root while tool dispatch is at `/mcp` — they compose from a common base in practice but reverse-proxy setups need them explicit. `GBRAIN_REMOTE_CLIENT_SECRET` env var overrides the config-file value for headless agents; secrets supplied via env stay out of disk.
+- `isThinClient(config)` helper in `src/core/config.ts` — single source of truth for the "is this install a thin client?" check used by the CLI dispatch guard, doctor branch, and remote subcommands.
+
+**New CLI dispatch guard** (`src/cli.ts`):
+
+- Single top-level check refuses 9 DB-bound commands with a canonical error naming the remote `mcp_url` when `remote_mcp` is set. Runs BEFORE `connectEngine` so commands never enter the engine factory only to fail late. Doctor branches to a new `runRemoteDoctor` for thin-client installs.
+- `engine` field on `GBrainConfig` stays as today (`postgres | pglite`) — thin-client mode is a separate code path, NOT an engine kind extension.
+
+**New thin-client doctor** (`src/core/doctor-remote.ts`, ~180 LOC):
+
+- Five outbound HTTP probes scoped to "is the remote MCP we configured actually reachable?": config_integrity (URL fields well-formed), oauth_credentials (secret resolvable), oauth_discovery, oauth_token, mcp_smoke. Output shape matches the local doctor's Check surface (`schema_version: 2`) so JSON consumers can union the two without conditional logic.
+
+**New focused server-side doctor** (`src/commands/doctor.ts:doctorReportRemote`):
+
+- Used by the new `run_doctor` MCP op for `gbrain remote doctor`. Five checks: connection (engine reachable), schema_version (current vs latest), brain_score (5-component composite), sync_failures (file-plane JSONL count), queue_health (Postgres-only stalled-job sweep). Engine-agnostic — uses `engine.executeRaw` + `engine.getConfig` + `engine.getHealth`. Local doctor (`runDoctor`) is unchanged; operators on the host still get the full check set.
+- New `DoctorReport` interface + `computeDoctorReport(checks)` exported for shared status/score math.
+
+**New MCP op** (`src/core/operations.ts`):
+
+- `run_doctor` (`scope: 'admin'`, `localOnly: false`, `mutating: false`) wraps `doctorReportRemote()` and returns the structured DoctorReport. First read-only diagnostic op exposed over HTTP MCP. Doctor only — generalizing to lint/integrity/orphans is filed as follow-up pending demand.
+
+**New outbound HTTP MCP client** (`src/core/mcp-client.ts`, ~210 LOC):
+
+- Wraps the official `@modelcontextprotocol/sdk` `Client` + `StreamableHTTPClientTransport` with OAuth `client_credentials` minting, in-process token caching (Map keyed by `mcp_url`, expires_at with 30s safety margin), and refresh-on-401 retry semantics. Initial-credentials-fail surfaces immediately as `RemoteMcpError(auth)` — retry only fires when a previously-good token gets rejected mid-session. Auth-fail-after-refresh produces a structured error pointing the operator at `gbrain auth register-client`.
+- Probe helpers in `src/core/remote-mcp-probe.ts` (`discoverOAuth`, `mintClientCredentialsToken`, `smokeTestMcp`) — pure `fetch`-based, no SDK dep, used by both init's setup smoke and the thin-client doctor.
+
+**New documentation**:
+
+- `docs/architecture/topologies.md` — three topology diagrams (single brain, cross-machine thin client, split-engine per-worktree) with concrete setup recipes. Honest about Topology 3's manual-alias routing (wrong alias = silent wrong-brain writes).
+- `skills/setup/SKILL.md` — new Phase A.5 walks the user through which topology fits before running `gbrain init`. Thin-client path skips Phases B/C/C.5/H entirely.
+
+**Tests** (72 new test cases across 6 new files):
+
+- `test/init-mcp-only.test.ts` (15 cases) — happy path, env-var-supplied secret stays out of disk, all four required-flag missing-error paths, three pre-flight smoke-failure paths, network-unreachable, four re-run-guard variants.
+- `test/cli-dispatch-thin-client.test.ts` (14 cases) — 9 refused commands × canonical error, 2 safe commands still work, doctor routes to runRemoteDoctor, regression for local config.
+- `test/doctor-remote.test.ts` (12 cases) — 5 thin-client checks against in-process HTTP fixture, every probe failure mode (404/parse/auth/network/server-error), env-var override of secret.
+- `test/doctor-report-remote.test.ts` (11 cases) — 5 PGLite checks, computeDoctorReport math.
+- `test/mcp-client.test.ts` (13 cases) — token cache, force-refresh, every error reason path, unpackToolResult parse failures.
+- `test/e2e/thin-client.test.ts` (7 cases against real Postgres + `gbrain serve --http`) — full cross-machine flow: init → doctor → sync refused → remote doctor → remote ping → re-run-guard → scope-mismatch regression.
+
+All tests use async `Bun.spawn` for subprocess invocation rather than `execFileSync`, which deadlocks against in-process HTTP fixtures because the parent's event loop can't accept connections while sync-blocked.
+
 ## [0.29.1] - 2026-05-05
 
 **Recency and salience as two orthogonal options. Agent in charge.**
@@ -437,9 +664,6 @@ gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s.json \
 
 If anything looks off, file at https://github.com/garrytan/gbrain/issues
 with `gbrain doctor` output.
-
-
-
 
 ## [0.28.11] - 2026-05-07
 
