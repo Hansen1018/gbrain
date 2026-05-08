@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
-import { LATEST_VERSION, runMigrations, MIGRATIONS, getIdleBlockers } from '../src/core/migrate.ts';
+import { LATEST_VERSION, runMigrations, MIGRATIONS, getIdleBlockers, hasPendingMigrations } from '../src/core/migrate.ts';
 import type { IdleBlocker } from '../src/core/migrate.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -18,6 +18,49 @@ describe('migrate', () => {
 
   // Integration tests for actual migration execution require DATABASE_URL
   // and are covered in the E2E suite (test/e2e/mechanical.test.ts)
+});
+
+// v0.28.5 — A1: cheap probe used by `connectEngine` to gate `initSchema()`
+// so already-migrated brains don't pay the schema-replay cost on every
+// short-lived CLI invocation. Closes #651 in cooperation with X1's
+// post-upgrade auto-apply, without #652's perf regression.
+describe('hasPendingMigrations', () => {
+  test('returns false on a fully-migrated brain (version === LATEST)', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema(); // applies all migrations through LATEST_VERSION
+      expect(await hasPendingMigrations(engine)).toBe(false);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('returns true when version config is behind LATEST_VERSION', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      // Simulate an older brain by rewinding the version row.
+      await engine.setConfig('version', '1');
+      expect(await hasPendingMigrations(engine)).toBe(true);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('returns true when version config is missing entirely (defensive default)', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      // Don't call initSchema. Probe against an empty PGlite — getConfig should
+      // either return null (treated as version=1) or throw on missing config
+      // table; either way the probe must say "yes pending."
+      expect(await hasPendingMigrations(engine)).toBe(true);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -1100,6 +1143,40 @@ describe('migration v31 — eval_capture_tables', () => {
 
   test('LATEST_VERSION caught up to 31', () => {
     expect(LATEST_VERSION).toBeGreaterThanOrEqual(31);
+  });
+});
+
+describe('migration v40 — pages_emotional_weight (v0.29)', () => {
+  // v0.29 ships off master. Master is at v39 (multimodal_dual_column_v0_27_1);
+  // v0.29 lands at v40. Idempotent ADD COLUMN IF NOT EXISTS, so brains that
+  // applied this at any prior number on a feature branch see v40 as new and
+  // run cleanly.
+  test('exists with the expected name', () => {
+    const v40 = MIGRATIONS.find(m => m.version === 40);
+    expect(v40).toBeDefined();
+    expect(v40?.name).toBe('pages_emotional_weight');
+  });
+
+  test('adds emotional_weight REAL NOT NULL DEFAULT 0.0 to pages', () => {
+    const v40 = MIGRATIONS.find(m => m.version === 40);
+    const sql = v40!.sql || '';
+    expect(sql).toContain('ALTER TABLE pages');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS emotional_weight');
+    expect(sql).toContain('REAL');
+    expect(sql).toContain('NOT NULL DEFAULT 0.0');
+  });
+
+  test('does NOT create an idx_pages_emotional_weight index (eng review D6)', () => {
+    // Salience query orders by computed score, not raw weight; the index
+    // would never be used. Adding it later requires a separate migration.
+    const v40 = MIGRATIONS.find(m => m.version === 40);
+    const sql = v40!.sql || '';
+    expect(sql).not.toContain('idx_pages_emotional_weight');
+    expect(sql).not.toContain('CREATE INDEX');
+  });
+
+  test('LATEST_VERSION caught up to 40', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(40);
   });
 });
 
